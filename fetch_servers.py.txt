@@ -1,0 +1,265 @@
+import requests
+import sqlite3
+import time
+from datetime import datetime
+
+# Configuration
+API_BASE = "https://api.cornbread2100.com/servers"
+DATABASE = "minecraft_servers.db"
+BATCH_SIZE = 100  # Max allowed by API
+REQUEST_DELAY = 1  # Seconds between requests to be polite
+
+def int_to_ip(ip_int):
+    """Convert integer IP to standard format"""
+    return f"{(ip_int >> 24) & 0xFF}.{(ip_int >> 16) & 0xFF}.{(ip_int >> 8) & 0xFF}.{ip_int & 0xFF}"
+
+def setup_database():
+    """Create database and tables"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS servers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT NOT NULL,
+            port INTEGER NOT NULL,
+            version TEXT,
+            protocol INTEGER,
+            description TEXT,
+            max_players INTEGER,
+            online_players INTEGER,
+            has_forge BOOLEAN,
+            has_favicon BOOLEAN,
+            last_seen INTEGER,
+            discovered INTEGER,
+            country TEXT,
+            checked BOOLEAN DEFAULT 0,
+            has_builds BOOLEAN DEFAULT NULL,
+            downloaded BOOLEAN DEFAULT 0,
+            notes TEXT,
+            UNIQUE(ip, port)
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS fetch_progress (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_offset INTEGER DEFAULT 0,
+            total_fetched INTEGER DEFAULT 0,
+            last_fetch_time INTEGER
+        )
+    ''')
+    
+    # Initialize progress tracking
+    cursor.execute('INSERT OR IGNORE INTO fetch_progress (id, last_offset) VALUES (1, 0)')
+    
+    conn.commit()
+    conn.close()
+    print("✓ Database initialized")
+
+def get_progress():
+    """Get current fetch progress"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT last_offset, total_fetched FROM fetch_progress WHERE id=1')
+    result = cursor.fetchone()
+    conn.close()
+    return result if result else (0, 0)
+
+def update_progress(offset, total):
+    """Update fetch progress"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE fetch_progress 
+        SET last_offset=?, total_fetched=?, last_fetch_time=?
+        WHERE id=1
+    ''', (offset, total, int(time.time())))
+    conn.commit()
+    conn.close()
+
+def fetch_vanilla_servers_batch(offset=0, limit=BATCH_SIZE):
+    """Fetch a batch of vanilla servers from API"""
+    params = {
+        'limit': limit,
+        'vanilla': 'true',  # Only vanilla servers
+        'offset': offset
+    }
+    
+    try:
+        print(f"  Fetching servers {offset} to {offset + limit}...")
+        response = requests.get(API_BASE, params=params, timeout=30)
+        response.raise_for_status()
+        servers = response.json()
+        print(f"  ✓ Retrieved {len(servers)} servers")
+        return servers
+    except requests.exceptions.RequestException as e:
+        print(f"  ✗ Error fetching batch: {e}")
+        return []
+
+def save_servers_to_db(servers):
+    """Save servers to database"""
+    if not servers:
+        return 0, 0
+    
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    new_count = 0
+    updated_count = 0
+    
+    for server in servers:
+        ip = int_to_ip(server['ip'])
+        port = server['port']
+        version = server.get('version', {}).get('name', 'Unknown')
+        protocol = server.get('version', {}).get('protocol', 0)
+        description = server.get('description', '')
+        max_players = server.get('players', {}).get('max', 0)
+        online_players = server.get('players', {}).get('online', 0)
+        has_forge = server.get('hasForgeData', False)
+        has_favicon = server.get('hasFavicon', False)
+        last_seen = server.get('lastSeen', 0)
+        discovered = server.get('discovered', 0)
+        country = server.get('geo', {}).get('country', 'Unknown')
+        
+        try:
+            cursor.execute('''
+                INSERT INTO servers 
+                (ip, port, version, protocol, description, max_players, 
+                 online_players, has_forge, has_favicon, last_seen, discovered, country)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (ip, port, version, protocol, description, max_players,
+                  online_players, has_forge, has_favicon, last_seen, discovered, country))
+            new_count += 1
+        except sqlite3.IntegrityError:
+            cursor.execute('''
+                UPDATE servers 
+                SET version=?, protocol=?, description=?, max_players=?,
+                    online_players=?, last_seen=?, country=?, has_favicon=?
+                WHERE ip=? AND port=?
+            ''', (version, protocol, description, max_players,
+                  online_players, last_seen, country, has_favicon, ip, port))
+            updated_count += 1
+    
+    conn.commit()
+    conn.close()
+    return new_count, updated_count
+
+def fetch_all_servers(max_batches=None):
+    """Fetch all vanilla servers in batches"""
+    print("\n" + "="*60)
+    print("FETCHING VANILLA SERVERS FROM API")
+    print("="*60 + "\n")
+    
+    offset, total_fetched = get_progress()
+    batch_num = offset // BATCH_SIZE + 1
+    total_new = 0
+    total_updated = 0
+    
+    print(f"Resuming from offset {offset} (batch {batch_num})")
+    print(f"Already fetched: {total_fetched} servers total\n")
+    
+    while True:
+        if max_batches and batch_num > max_batches:
+            print(f"\nReached max batch limit ({max_batches})")
+            break
+        
+        print(f"[Batch {batch_num}]")
+        servers = fetch_vanilla_servers_batch(offset)
+        
+        if not servers:
+            print("\n✓ No more servers to fetch!")
+            break
+        
+        new, updated = save_servers_to_db(servers)
+        total_new += new
+        total_updated += updated
+        total_fetched += len(servers)
+        
+        print(f"  Added: {new} new, Updated: {updated} existing")
+        
+        offset += BATCH_SIZE
+        batch_num += 1
+        update_progress(offset, total_fetched)
+        
+        # Be nice to the API
+        time.sleep(REQUEST_DELAY)
+    
+    print("\n" + "="*60)
+    print(f"FETCH COMPLETE")
+    print(f"Total new servers: {total_new}")
+    print(f"Total updated: {total_updated}")
+    print(f"Total fetched this session: {total_new + total_updated}")
+    print("="*60 + "\n")
+
+def show_stats():
+    """Display database statistics"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM servers")
+    total = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM servers WHERE checked=0")
+    unchecked = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM servers WHERE has_builds=1")
+    with_builds = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM servers WHERE downloaded=1")
+    downloaded = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM servers WHERE online_players > 0")
+    with_players = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    print("="*60)
+    print("DATABASE STATISTICS")
+    print("="*60)
+    print(f"Total vanilla servers:     {total:,}")
+    print(f"Unchecked:                 {unchecked:,}")
+    print(f"With builds (confirmed):   {with_builds:,}")
+    print(f"Already downloaded:        {downloaded:,}")
+    print(f"Currently have players:    {with_players:,}")
+    print("="*60 + "\n")
+
+def reset_progress():
+    """Reset fetch progress to start from beginning"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE fetch_progress SET last_offset=0, total_fetched=0 WHERE id=1')
+    conn.commit()
+    conn.close()
+    print("✓ Progress reset to start from beginning\n")
+
+def main():
+    import sys
+    
+    print("\n" + "="*60)
+    print("MINECRAFT VANILLA SERVER DISCOVERY - PHASE 2")
+    print("="*60 + "\n")
+    
+    setup_database()
+    
+    # Check command line arguments
+    if len(sys.argv) > 1:
+        if sys.argv[1] == '--reset':
+            reset_progress()
+        elif sys.argv[1] == '--stats':
+            show_stats()
+            return
+        elif sys.argv[1] == '--test':
+            print("TEST MODE: Fetching first 3 batches only\n")
+            fetch_all_servers(max_batches=3)
+            show_stats()
+            return
+    
+    # Full fetch
+    fetch_all_servers()
+    show_stats()
+    
+    print("✓ Phase 2 complete! Ready for Phase 3.\n")
+
+if __name__ == "__main__":
+    main()
