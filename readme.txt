@@ -1,3 +1,5 @@
+Live run: https://youtu.be/6s74uC5A6zg
+
 COMPLETE SETUP GUIDE
 Prerequisites:
 bashpip install pyautogui requests
